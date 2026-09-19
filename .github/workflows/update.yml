@@ -18,14 +18,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 抓取并更新数据（最多重试3次）
-        run: |
-          for i in 1 2 3; do
-            python update_data.py && exit 0
-            echo "第 $i 次尝试失败，90 秒后重试..."
-            sleep 90
-          done
-          exit 1
+      - name: 抓取并更新数据
+        run: python update_data.py
 
       - name: 提交更新
         run: |

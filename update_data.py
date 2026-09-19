@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """多源抓取五部门《生猪产品数据》并更新 index.html。
-说明：
 - GitHub 机房 IP 会被国内站点 WAF 挑战，默认直连失败自动改走 r.jina.ai 阅读器代理。
 - 环境变量 JINA: auto(默认) / always / off
-- 若设置 GH_TOKEN + GH_REPO，则直接通过 GitHub API 写回仓库（供国内云函数使用）；
-  否则读写本地 index.html（GitHub Actions 模式）。
-"""
+- 若设置 GH_TOKEN + GH_REPO，则通过 GitHub API 直接写回仓库（供国内云函数使用），
+  否则读写本地 index.html（GitHub Actions 模式）。"""
 import re, json, time, html, base64, os, urllib.request, urllib.parse, pathlib, datetime, sys
 
 HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -41,7 +39,8 @@ def strip_tags(h):
     h = re.sub(r"<script.*?</script>", " ", h, flags=re.S | re.I)
     h = re.sub(r"<style.*?</style>", " ", h, flags=re.S | re.I)
     h = re.sub(r"<[^>]+>", " ", h)
-    h = html.unescape(h).replace("|", " ")
+    # 表格单元格分隔符换成全角逗号并保留，避免数值与环比数字粘连
+    h = html.unescape(h).replace("|", "，")
     return re.sub(r"\s+", "", h)
 
 
@@ -78,15 +77,36 @@ def save_html(t, sha):
         (HERE / "index.html").write_text(t, encoding="utf-8")
 
 
-# ---------------- 数据解析 ----------------
+# ---------------- 数据解析（无分组正则，彻底规避全半角括号问题） ----------------
+
+NUM = re.compile(r"\d+(?:\.\d+)?")  # 纯半角写法，预先编译
+
+
+def find_ym(text):
+    """定位 '2026年4月份'，返回 (年, 月)；找不到返回 None。无捕获分组。"""
+    mm = re.search(r"20\d\d年\d{1,2}月份", text)
+    if not mm:
+        return None
+    s = mm.group(0)  # 形如 2026年4月份 / 2026年12月份
+    return s[:4], int(s[5:s.find("月")])
+
+
+def find_quarter(text, label):
+    """定位 '2026年1季度末能繁母猪存栏'，返回 (年, 季度)。"""
+    mm = re.search(r"20\d\d年[1-4]季度末" + label, text)
+    if not mm:
+        return None
+    s = mm.group(0)
+    return s[:4], s[5]
+
 
 def parse_text(text, db):
-    """从一篇文章文本中提取 8 项指标。用字符串查找+取数，不用复杂分组正则。"""
-    m = re.search(r"(20\d\d）年（\d{1,2}）月份", text)
-    if not m:
+    ym = find_ym(text)
+    if not ym:
         return 0
-    mk = "%s-%02d" % (m.group(1), int(m.group(2)))
-    prefix = "%s年%d月份" % (m.group(1), int(m.group(2)))
+    y, mo = ym
+    mk = "%s-%02d" % (y, mo)
+    prefix = "%s年%d月份" % (y, mo)
     added = 0
 
     def put(group, target, key, val, isint=False):
@@ -101,9 +121,9 @@ def parse_text(text, db):
         if i < 0:
             return
         seg = text[i + len(label): i + len(label) + 25]
-        mm = re.search(r"(\d+(?:\.\d+)?)", seg)
+        mm = NUM.search(seg)
         if mm:
-            put(group, target, mk, mm.group(1))
+            put(group, target, mk, mm.group(0))
 
     grab(prefix + "生猪定点屠宰企业屠宰量", "monthly", "屠宰量")
     grab(prefix + "全国二元母猪销售价格", "monthly", "二元母猪销售价格")
@@ -114,18 +134,18 @@ def parse_text(text, db):
     grab(prefix + "全国批发市场白条猪价格", "monthly", "全国批发市场白条猪价格")
     grab(prefix + "县乡集贸市场猪肉零售价格", "monthly", "县乡集贸市场猪肉零售价格")
 
-    q = re.search(r"(20\d\d）年（[1-4]）季度末能繁母猪存栏", text)
+    q = find_quarter(text, "能繁母猪存栏")
     if q:
-        seg = text[q.end(): q.end() + 25]
-        mm = re.search(r"(\d+)", seg)
+        mm = NUM.search(text[text.find("季度末能繁母猪存栏") + len("季度末能繁母猪存栏"):
+                            text.find("季度末能繁母猪存栏") + len("季度末能繁母猪存栏") + 25])
         if mm:
-            put("quarterly", "能繁母猪存栏量", "%s-Q%s" % (q.group(1), q.group(2)), mm.group(1), True)
-    q2 = re.search(r"(20\d\d）年（[1-4]）季度末生猪存栏", text)
+            put("quarterly", "能繁母猪存栏量", "%s-Q%s" % q, mm.group(0), True)
+    q2 = find_quarter(text, "生猪存栏")
     if q2:
-        seg = text[q2.end(): q2.end() + 25]
-        mm = re.search(r"(\d+)", seg)
+        mm = NUM.search(text[text.find("季度末生猪存栏") + len("季度末生猪存栏"):
+                            text.find("季度末生猪存栏") + len("季度末生猪存栏") + 25])
         if mm:
-            put("quarterly", "生猪存栏量", "%s-Q%s" % (q2.group(1), q2.group(2)), mm.group(1), True)
+            put("quarterly", "生猪存栏量", "%s-Q%s" % q2, mm.group(0), True)
     return added
 
 
@@ -137,7 +157,7 @@ def safe_parse(t, db, stat):
         stat[0] += (1 if a > 0 else 0)
     except Exception as e:
         stat[2] += 1
-        if stat[2] <= 2:
+        if stat[2] <= 3:
             print("    (某篇解析异常: %s)" % e)
 
 

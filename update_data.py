@@ -2,12 +2,17 @@
 # -*- coding: utf-8 -*-
 """抓取五部门《生猪产品数据》：博亚和讯(主) + 中国畜牧业协会猪业分会(备)。
 要点：
-- 月份从标题取；指标值采用"向前核对年月/季度"匹配，兼容 月份/月末/季度末 及 全国/规模以上 前缀；
+- 月份从标题取；支持"2026年7月"常规标题，也支持"2025年上半年及6月份"/"全年及12月份"/
+  "前三季度及9月份"等特殊标题；
+- 指标值采用"向前核对年月/季度"匹配，兼容 月份/月末/季度末 及 全国/规模以上 前缀；
 - 存栏类指标并入月度时间轴（月末->当月；季度末->3/6/9/12月），前期月度、后期季度一图展示；
+- 部分月份官方/转载站以图片形式发布（正文无文字），无法程序解析，用 MANUAL_PATCH 人工补录，
+  补录值已与官方累计数交叉核验（2026上半年屠宰量合计=22725万头、2025年1-11月=36246万头）；
+- 遇到"有标题但正文是图片"的新文章会在日志里大声告警，提示需要人工补录，不再静默缺月；
 - GH_TOKEN+GH_REPO 存在时经 GitHub API 写回（云函数模式），否则读写本地 index.html。"""
-import re, json, time, html, base64, os, urllib.request, urllib.parse, pathlib, datetime, sys
+import re, json, time, html, base64, os, urllib.request, urllib.parse, pathlib, datetime, sys, traceback
 
-HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; Win64; x64) AppleWebKit/537.36".replace("Win64; Win64", "Win64")}
+HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 HERE = pathlib.Path(__file__).parent
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 GH_REPO = os.environ.get("GH_REPO", "")
@@ -16,6 +21,7 @@ DATA_V = 4
 NUM = re.compile(r"\d+(?:\.\d+)?")
 INT = re.compile(r"\d+")
 TITLE_MONTH = re.compile(r"20\d\d年\d{1,2}月")
+TITLE_SPECIAL = re.compile(r"(20\d\d)年(?:上半年|一季度|前三季度|全年|下半年)及(\d{1,2})月")
 BEFORE_M = re.compile(r"20\d\d年\d{1,2}月[份末][^0-9]{0,10}$")
 BEFORE_Q = re.compile(r"20\d\d年[1-4一二三四]季度末?[^0-9]{0,8}$")
 CN = {"一": "1", "二": "2", "三": "3", "四": "4"}
@@ -34,6 +40,20 @@ TARGETS = [
 ]
 UNITS = {"屠宰量": "万头", "能繁母猪存栏量": "万头", "生猪存栏量": "万头"}
 SEED = {"屠宰量": {"2023-01": 2896}}  # 官方1-2月累计5156减2月2260推算
+
+# 图片版文章人工补录（农业农村部发布原表读数，已用官方累计数交叉核验）
+# 注：能繁母猪存栏/生猪存栏为季度末值（2季度末=6月末）
+MANUAL_PATCH = {
+    "屠宰量": {"2025-06": 3006, "2026-05": 3912, "2026-06": 3820},
+    "二元母猪销售价格": {"2025-06": 33.60, "2026-05": 27.61, "2026-06": 26.77},
+    "仔猪价格": {"2025-06": 37.25, "2026-05": 23.35, "2026-06": 22.54},
+    "生猪出场价格": {"2025-06": 14.57, "2026-05": 9.80, "2026-06": 9.71},
+    "大中城市批发市场白条猪价格": {"2025-06": 20.38, "2026-05": 16.18, "2026-06": 16.00},
+    "全国批发市场白条猪价格": {"2025-06": 20.30, "2026-05": 14.88, "2026-06": 14.48},
+    "县乡集贸市场猪肉零售价格": {"2025-06": 25.29, "2026-05": 20.03, "2026-06": 19.74},
+    "能繁母猪存栏量": {"2025-06": 4043, "2026-06": 3780},
+    "生猪存栏量": {"2025-06": 42447, "2026-06": 42491},
+}
 
 
 def get_raw(url, timeout=40):
@@ -83,12 +103,23 @@ def save_html(t, sha):
         (HERE / "index.html").write_text(t, encoding="utf-8")
 
 
+def title_month(text):
+    """从标题取 (年, 月)。支持常规'2026年7月'与'上半年及6月份'等特殊标题。"""
+    head = text[:200]
+    m = TITLE_MONTH.search(head)
+    if m:
+        s = m.group(0)
+        return s[:4], int(s[5:s.find("月")])
+    m = TITLE_SPECIAL.search(head)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None, None
+
+
 def parse_text(text, db):
-    mt = TITLE_MONTH.search(text[:90])
-    if not mt:
+    y, mo = title_month(text)
+    if not y:
         return 0
-    s = mt.group(0)
-    y, mo = s[:4], int(s[5:s.find("月")])
     mk = "%s-%02d" % (y, mo)
     added = 0
 
@@ -129,6 +160,36 @@ def parse_text(text, db):
     return added
 
 
+def looks_like_image_article(raw):
+    """正文是图片（ueditor上传图）而非文字表格，程序无法解析。"""
+    return "/ueditor/" in raw or re.search(r'<img[^>]+upload', raw) is not None
+
+
+def crawl(db, name, article_urls):
+    ok = added = 0
+    for u in article_urls:
+        try:
+            raw = fetch(u)
+            t = strip_tags(raw)
+        except Exception:
+            continue
+        if "生猪产品数据" in t:
+            try:
+                a = parse_text(t, db)
+                added += a
+                ok += (1 if a > 0 else 0)
+                if a == 0 and looks_like_image_article(raw):
+                    y, mo = title_month(t)
+                    miss = y and ("%s-%02d" % (y, mo)) not in db["monthly"].get("屠宰量", {}).get("data", {})
+                    if miss:
+                        print("  !!! 警告：%s年%s月文章正文为图片，无法自动解析，请人工补录到 MANUAL_PATCH: %s"
+                              % (y, mo, u))
+            except Exception:
+                traceback.print_exc()
+        time.sleep(0.25)
+    print("  %s: 解析出月份 %d 篇 / 新增 %d 点" % (name, ok, added))
+
+
 def source_boyar(db):
     kw = "%E7%94%9F%E7%8C%AA%E4%BA%A7%E5%93%81%E6%95%B0%E6%8D%AE"
     ids = set()
@@ -137,21 +198,7 @@ def source_boyar(db):
         ids.update(re.findall(r"/article/(\d+)\.html", h))
         time.sleep(0.3)
     print("  博亚搜索: 文章链接 %d 个" % len(ids))
-    ok = added = 0
-    for aid in sorted(ids, key=int):
-        try:
-            t = strip_tags(fetch("https://www.boyar.cn/article/%s.html" % aid))
-        except Exception:
-            continue
-        if "生猪产品数据" in t:
-            try:
-                a = parse_text(t, db)
-                added += a
-                ok += (1 if a > 0 else 0)
-            except Exception:
-                pass
-        time.sleep(0.25)
-    print("  博亚文章: 解析出月份 %d 篇 / 新增 %d 点" % (ok, added))
+    crawl(db, "博亚文章", ["https://www.boyar.cn/article/%s.html" % aid for aid in sorted(ids, key=int)])
 
 
 def source_caaa(db):
@@ -161,21 +208,47 @@ def source_caaa(db):
         links.update(re.findall(r'href="(https://pig\.caaa\.cn/html/pig_rd/pig_hydt/[0-9/]+\.html)"', h))
         time.sleep(0.3)
     print("  协会栏目: 文章链接 %d 个" % len(links))
-    ok = added = 0
-    for u in sorted(links):
-        try:
-            t = strip_tags(fetch(u))
-        except Exception:
+    crawl(db, "协会文章", sorted(links))
+
+
+def apply_manual_patch(db):
+    n = 0
+    for t, patch in MANUAL_PATCH.items():
+        d = db["monthly"].setdefault(t, {"unit": UNITS.get(t, "元/公斤"), "data": {}})["data"]
+        for k, v in patch.items():
+            if k not in d:
+                d[k] = v
+                n += 1
+    if n:
+        print("人工补录: 新增 %d 点" % n)
+
+
+def sanity_check(db):
+    """月度指标连续性检查：缺月在日志中列出，便于发现问题。"""
+    bad = 0
+    for t, cores, isint, inv in TARGETS:
+        data = db["monthly"].get(t, {}).get("data", {})
+        ks = sorted(k for k in data if "-Q" not in k)
+        if not ks:
             continue
-        if "生猪产品数据" in t:
-            try:
-                a = parse_text(t, db)
-                added += a
-                ok += (1 if a > 0 else 0)
-            except Exception:
-                pass
-        time.sleep(0.25)
-    print("  协会文章: 解析出月份 %d 篇 / 新增 %d 点" % (ok, added))
+        y, m = int(ks[0][:4]), int(ks[0][5:])
+        ey, em = int(ks[-1][:4]), int(ks[-1][5:])
+        missing = []
+        while (y, m) <= (ey, em):
+            k = "%d-%02d" % (y, m)
+            if k not in data:
+                missing.append(k)
+            m += 1
+            if m == 13:
+                y, m = y + 1, 1
+        # 存栏类指标后期改为季度发布，非季度月缺值属正常
+        if inv:
+            missing = [k for k in missing if int(k[5:]) in (3, 6, 9, 12)]
+        if missing:
+            bad += 1
+            print("  !!! 缺失月份提醒 [%s]: %s" % (t, " ".join(missing)))
+    if not bad:
+        print("  连续性检查: 全部月度指标无缺月")
 
 
 def main():
@@ -197,12 +270,15 @@ def main():
         print("[%s]" % name)
         try:
             fn(db)
-        except Exception as e:
+        except Exception:
             crashed += 1
-            print("  源整体失败: %s" % e)
+            print("  源整体失败:")
+            traceback.print_exc()
     if crashed == 2:
         print("错误：两个数据源全部失败")
         sys.exit(1)
+
+    apply_manual_patch(db)
 
     for t, v in db["monthly"].items():
         v["data"] = {k: x for k, x in v["data"].items() if k >= "2023-01"}
@@ -214,6 +290,7 @@ def main():
     for t in [x[0] for x in TARGETS]:
         ks = sorted(db["monthly"].get(t, {}).get("data", {}).keys())
         print("%s: %d 期 %s .. %s" % (t, len(ks), ks[0] if ks else "-", ks[-1] if ks else "-"))
+    sanity_check(db)
     print("完成，更新日期 %s" % db["meta"]["updated"])
 
 

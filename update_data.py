@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""多源抓取五部门《生猪产品数据》。
-GitHub 机房 IP 会被国内站点 WAF 挑战，默认直连失败自动走 r.jina.ai 阅读器代理。
-环境变量 JINA: auto(默认) / always / off；GH_TOKEN+GH_REPO 存在时直接写回 GitHub（供国内云函数使用）。"""
+"""多源抓取五部门《生猪产品数据》。GitHub 机房 IP 会被国内站点 WAF 挑战，默认直连失败自动走 r.jina.ai 阅读器代理。
+环境变量 JINA: auto(默认)/always/off；GH_TOKEN+GH_REPO 存在时直接写回 GitHub（供国内云函数使用）。"""
 import re, json, time, html, base64, os, urllib.request, urllib.parse, pathlib, datetime, sys
 
 HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -58,6 +57,7 @@ def save_html(t, sha):
         (HERE / "index.html").write_text(t, encoding="utf-8")
 
 def parse_text(text, db):
+    """标签后允许出现任意非数字字符（单位括号等），再取数值，避免括号全半角问题。"""
     m = re.search(r"(20\d\d）年（\d{1,2}）月份", text)
     if not m:
         return 0
@@ -70,7 +70,7 @@ def parse_text(text, db):
             d[key] = int(val) if isint else float(val)
             added += 1
     def mp(label):
-        return rf"20\d\d年\d{{1,2}}月份{label}（?：（?:元/公斤）|（万头））?\s*(\d+(?:\.\d+)?)"
+        return r"20\d\d年\d{1,2}月份" + label + r"[^0-9]{0,15}(\d+(?:\.\d+)?)"
     for label, target in [
         (r"(?：规模以上）?生猪定点屠宰企业屠宰量", "屠宰量"),
         (r"全国二元母猪销售价格", "二元母猪销售价格"),
@@ -83,13 +83,23 @@ def parse_text(text, db):
         mm = re.search(mp(label), text)
         if mm:
             put("monthly", target, mk, mm.group(1))
-    mq = re.search(r"(20\d\d）年（[1-4]）季度末能繁母猪存栏（?：（万头））?（\d+)", text)
+    mq = re.search(r"(20\d\d）年（[1-4]）季度末能繁母猪存栏[^0-9]{0,15}(\d+)", text)
     if mq:
-        put("quarterly", "能繁母猪存栏量", f"{mq.group(1)}-Q{mq.group(2)}", mq.group(3), True)
-    hq = re.search(r"(20\d\d）年（[1-4]）季度末生猪存栏（?：（万头））?（\d+)", text)
+        put("quarterly", "能繁母猪存栏量", f"{mq.group(1)}-Q{mq.group(2)}", mq.group(2), True)
+    hq = re.search(r"(20\d\d）年（[1-4]）季度末生猪存栏[^0-9]{0,15}(\d+)", text)
     if hq:
-        put("quarterly", "生猪存栏量", f"{hq.group(1)}-Q{hq.group(2)}", hq.group(3), True)
+        put("quarterly", "生猪存栏量", f"{hq.group(1)}-Q{hq.group(2)}", hq.group(2), True)
     return added
+
+def safe_parse(t, db, stat):
+    try:
+        a = parse_text(t, db)
+        stat[1] += a
+        stat[0] += (a > 0)
+    except Exception as e:
+        stat[2] += 1
+        if stat[2] == 1:
+            print(f"    (首篇解析异常: {e})")
 
 def source_boyar(db):
     kw = "%E7%94%9F%E7%8C%AA%E4%BA%A7%E5%93%81%E6%95%B0%E6%8D%AE"
@@ -104,7 +114,8 @@ def source_boyar(db):
         ids.update(found)
         time.sleep(0.3)
     print(f"  博亚搜索: 收集到文章链接 {len(ids)} 个")
-    kw_hit = ok = added = 0
+    kw_hit = 0
+    stat = [0, 0, 0]  # 解析出月份篇数, 新增点数, 异常篇数
     for aid in sorted(ids, key=int):
         try:
             t = strip_tags(fetch(f"https://www.boyar.cn/article/{aid}.html"))
@@ -112,11 +123,9 @@ def source_boyar(db):
             continue
         if "生猪产品数据" in t:
             kw_hit += 1
-            a = parse_text(t, db)
-            added += a
-            ok += (a > 0)
+            safe_parse(t, db, stat)
         time.sleep(0.25)
-    print(f"  博亚文章: 含关键词 {kw_hit} 篇 / 解析出月份 {ok} 篇 / 新增 {added} 点")
+    print(f"  博亚文章: 含关键词 {kw_hit} 篇 / 解析出月份 {stat[0]} 篇 / 新增 {stat[1]} 点")
 
 def source_caaa(db):
     links = set()
@@ -125,24 +134,23 @@ def source_caaa(db):
         if p == "index":
             f0 = re.findall(r'href="(https://pig\.caaa\.cn/html/pig_rd/pig_hydt/[0-9/]+\.html)"', h)
             if not f0 and JINA != "always":
-                f0 = re.findall(r'href="(https://pig\.caaa\.cn/html/pig_rd/pig_hydt/[0-9/]+\.html)"', fetch_jina(f"https://pig.caaa.cn/html/pig_rd/pig_hydt/{p}.html"))
+                f0 = re.findall(r'href="(https://pig\.caaa\.cn/html/pig_rd/pig_hydt/[0-9/]+\.html)"',
+                                fetch_jina("https://pig.caaa.cn/html/pig_rd/pig_hydt/index.html"))
             links.update(f0)
         else:
             links.update(re.findall(r'href="(https://pig\.caaa\.cn/html/pig_rd/pig_hydt/[0-9/]+\.html)"', h))
         time.sleep(0.3)
     print(f"  协会栏目: 收集到文章链接 {len(links)} 个")
-    ok = added = 0
+    stat = [0, 0, 0]
     for u in links:
         try:
             t = strip_tags(fetch(u))
         except Exception:
             continue
         if "生猪产品数据" in t:
-            a = parse_text(t, db)
-            added += a
-            ok += (a > 0)
+            safe_parse(t, db, stat)
         time.sleep(0.25)
-    print(f"  协会文章: 解析出月份 {ok} 篇 / 新增 {added} 点")
+    print(f"  协会文章: 解析出月份 {stat[0]} 篇 / 新增 {stat[1]} 点")
 
 def source_chinafeed(db):
     links = {}
@@ -157,16 +165,14 @@ def source_chinafeed(db):
                 links[m.group(1)] = 1
         time.sleep(0.3)
     print(f"  饲料栏目: 收集到生猪产品数据文章 {len(links)} 篇")
-    ok = added = 0
+    stat = [0, 0, 0]
     for u in links:
         try:
-            a = parse_text(strip_tags(fetch(u)), db)
-            added += a
-            ok += (a > 0)
+            safe_parse(strip_tags(fetch(u)), db, stat)
         except Exception:
             continue
         time.sleep(0.25)
-    print(f"  饲料文章: 解析出月份 {ok} 篇 / 新增 {added} 点")
+    print(f"  饲料文章: 解析出月份 {stat[0]} 篇 / 新增 {stat[1]} 点")
 
 def main():
     html_text, sha = load_html()

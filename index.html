@@ -22,6 +22,7 @@
   .note { max-width:1500px; margin:0 auto 40px; padding:0 20px; font-size:12px; color:#8a97a8; line-height:1.9; }
   @media(max-width:640px){ .grid{grid-template-columns:1fr;padding:12px;} .chart{height:300px;} }
 </style>
+<base target="_blank">
 </head>
 <body>
 <header>
@@ -479,8 +480,12 @@ function buildMonthly(name, cfg){
   return option;
 }
 
+const ro = new ResizeObserver(entries=>{
+  for(const e of entries){ const ch = echarts.getInstanceByDom(e.target); if(ch) ch.resize(); }
+});
 function renderAll(){
   charts.forEach(c=>c.dispose()); charts.length=0;
+  ro.disconnect();
   const grid = document.getElementById('grid'); grid.innerHTML='';
   const monthly = DB.monthly || {};
   const quarterly = DB.quarterly || {};
@@ -491,10 +496,14 @@ function renderAll(){
     const freq = qNames.includes(name) ? '季度' : '月度';
     card.innerHTML = `<h2>${name} <span style="font-size:12px;color:#8a97a8">（${freq}）</span></h2><div class="unit">单位：${cfg.unit}</div><div class="chart"></div>`;
     grid.appendChild(card);
-    const ch = echarts.init(card.querySelector('.chart'));
+    const el = card.querySelector('.chart');
+    const ch = echarts.init(el);
     ch.setOption(buildMonthly(name,cfg));
     charts.push(ch);
+    ro.observe(el);
   }
+  // 布局稳定后再统一重算一次，兜底任何初始化时序问题
+  requestAnimationFrame(()=>requestAnimationFrame(()=>charts.forEach(c=>c.resize())));
 }
 document.getElementById('btn-compare').onclick = e=>{mode='compare';setActive(e.target);renderAll();};
 document.getElementById('btn-series').onclick = e=>{mode='series';setActive(e.target);renderAll();};

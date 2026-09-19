@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """抓取五部门《生猪产品数据》：博亚和讯(主) + 中国畜牧业协会猪业分会(备)。
-月份从文章标题提取；指标值采用"向前核对年月"的方式匹配，规避侧边栏干扰。
-GH_TOKEN+GH_REPO 存在时经 GitHub API 写回（云函数模式），否则读写本地 index.html。"""
+要点：
+- 月份从标题取；指标值采用"向前核对年月/季度"匹配，兼容 月份/月末/季度末 及 全国/规模以上 前缀；
+- 存栏类指标并入月度时间轴（月末->当月；季度末->3/6/9/12月），前期月度、后期季度一图展示；
+- GH_TOKEN+GH_REPO 存在时经 GitHub API 写回（云函数模式），否则读写本地 index.html。"""
 import re, json, time, html, base64, os, urllib.request, urllib.parse, pathlib, datetime, sys
 
-HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; Win64; x64) AppleWebKit/537.36".replace("Win64; Win64", "Win64")}
 HERE = pathlib.Path(__file__).parent
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 GH_REPO = os.environ.get("GH_REPO", "")
-DATA_V = 3  # 数据结构版本，低于此值则重建
+DATA_V = 4
 
 NUM = re.compile(r"\d+(?:\.\d+)?")
 INT = re.compile(r"\d+")
 TITLE_MONTH = re.compile(r"20\d\d年\d{1,2}月")
-BEFORE_M = re.compile(r"20\d\d年\d{1,2}月份[^0-9]{0,10}$")
+BEFORE_M = re.compile(r"20\d\d年\d{1,2}月[份末][^0-9]{0,10}$")
 BEFORE_Q = re.compile(r"20\d\d年[1-4一二三四]季度末?[^0-9]{0,8}$")
-CN_NUM = {"一": "1", "二": "2", "三": "3", "四": "4"}
+CN = {"一": "1", "二": "2", "三": "3", "四": "4"}
 
-CORES = [
-    ("屠宰量", "monthly", ["生猪定点屠宰企业屠宰量"], False),
-    ("二元母猪销售价格", "monthly", ["二元母猪销售价格"], False),
-    ("仔猪价格", "monthly", ["全国仔猪价格", "仔猪价格"], False),
-    ("生猪出场价格", "monthly", ["生猪出场价格", "生猪出厂价格"], False),
-    ("大中城市批发市场白条猪价格", "monthly", ["36个大中城市批发市场白条猪价格"], False),
-    ("全国批发市场白条猪价格", "monthly", ["全国批发市场白条猪价格"], False),
-    ("县乡集贸市场猪肉零售价格", "monthly", ["县乡集贸市场猪肉零售价格"], False),
-    ("能繁母猪存栏量", "quarterly", ["季度末能繁母猪存栏", "能繁母猪存栏"], True),
-    ("生猪存栏量", "quarterly", ["季度末生猪存栏", "生猪存栏"], True),
+# (目标名, 匹配词列表, 是否整数, 是否存栏类)
+TARGETS = [
+    ("屠宰量", ["生猪定点屠宰企业屠宰量"], False, False),
+    ("二元母猪销售价格", ["二元母猪销售价格"], False, False),
+    ("仔猪价格", ["全国仔猪价格", "仔猪价格"], False, False),
+    ("生猪出场价格", ["生猪出场价格", "生猪出厂价格"], False, False),
+    ("大中城市批发市场白条猪价格", ["36个大中城市批发市场白条猪价格"], False, False),
+    ("全国批发市场白条猪价格", ["全国批发市场白条猪价格"], False, False),
+    ("县乡集贸市场猪肉零售价格", ["县乡集贸市场猪肉零售价格"], False, False),
+    ("能繁母猪存栏量", ["能繁母猪存栏"], True, True),
+    ("生猪存栏量", ["季度末生猪存栏", "生猪存栏"], True, True),
 ]
+UNITS = {"屠宰量": "万头", "能繁母猪存栏量": "万头", "生猪存栏量": "万头"}
+SEED = {"屠宰量": {"2023-01": 2896}}  # 官方1-2月累计5156减2月2260推算
 
 
 def get_raw(url, timeout=40):
@@ -46,9 +51,11 @@ def fetch(url):
 def strip_tags(h):
     h = re.sub(r"<script.*?</script>", " ", h, flags=re.S | re.I)
     h = re.sub(r"<style.*?</style>", " ", h, flags=re.S | re.I)
-    h = re.sub(r"<[^>]+>", " ", h)
+    h = re.sub(r"(?i)</(td|tr|p|li|h1|h2|h3|h4|div|table)>", "，", h)
+    h = re.sub(r"(?i)<br\s*/?>", "，", h)
+    h = re.sub(r"<[^>]+>", "", h)          # 行内span直接去掉，避免"2023 年"被逗号隔开
     h = html.unescape(h).replace("|", "，")
-    return re.sub(r"\s+", "，", h)
+    return re.sub(r"\s+", "", h)
 
 
 def gh_api(method, url, data=None):
@@ -77,7 +84,7 @@ def save_html(t, sha):
 
 
 def parse_text(text, db):
-    mt = TITLE_MONTH.search(text[:90])   # 月份只从标题区域取
+    mt = TITLE_MONTH.search(text[:90])
     if not mt:
         return 0
     s = mt.group(0)
@@ -87,44 +94,38 @@ def parse_text(text, db):
 
     def put(target, key, val, isint):
         nonlocal added
-        grp = "quarterly" if "-Q" in key else "monthly"
-        d = db[grp].setdefault(target, {"unit": "万头" if isint else "元/公斤", "data": {}})["data"]
+        d = db["monthly"].setdefault(target, {"unit": UNITS.get(target, "元/公斤"), "data": {}})["data"]
         if key not in d:
             d[key] = int(val) if isint else float(val)
             added += 1
 
-    def grab(core, target, isint):
-        start = 0
-        while True:
-            i = text.find(core, start)
-            if i < 0:
-                return
-            before = text[max(0, i - 22):i]
-            ok = False
-            key = mk
-            mm2 = BEFORE_M.search(before)
-            if mm2:
-                sm = TITLE_MONTH.search(mm2.group(0))
-                if sm and sm.group(0)[:4] == y and int(sm.group(0)[5:sm.group(0).find("月")]) == mo:
-                    ok = True
-            if not ok:
-                q2 = BEFORE_Q.search(before)
-                if q2:
-                    sq = q2.group(0)
-                    qq = CN_NUM.get(sq[5], sq[5])
-                    key = "%s-Q%s" % (sq[:4], qq)
-                    ok = True
-            if ok:
-                seg = text[i + len(core): i + len(core) + 25]
-                n = (INT if isint else NUM).search(seg)
-                if n:
-                    put(target, key, n.group(0), isint)
-                    return
-            start = i + 1
-
-    for target, grp, cores, isint in CORES:
+    for name, cores, isint, inv in TARGETS:
         for core in cores:
-            grab(core, target, isint)
+            start = 0
+            hit = False
+            while not hit:
+                i = text.find(core, start)
+                if i < 0:
+                    break
+                before = text[max(0, i - 22):i]
+                key = None
+                mm2 = BEFORE_M.search(before)
+                if mm2:
+                    sm = TITLE_MONTH.search(mm2.group(0))
+                    if sm and sm.group(0)[:4] == y and int(sm.group(0)[5:sm.group(0).find("月")]) == mo:
+                        key = mk
+                if key is None and inv:
+                    q2 = BEFORE_Q.search(before)
+                    if q2:
+                        sq = q2.group(0)
+                        key = "%s-%02d" % (sq[:4], int(CN.get(sq[5], sq[5])) * 3)
+                if key:
+                    seg = text[i + len(core): i + len(core) + 25]
+                    n = (INT if isint else NUM).search(seg)
+                    if n:
+                        put(name, key, n.group(0), isint)
+                        hit = True
+                start = i + 1
     return added
 
 
@@ -183,9 +184,13 @@ def main():
     db = json.loads(m.group(1))
     if db.get("meta", {}).get("v", 0) < DATA_V:
         print("检测到旧版/受损数据，自动清空重建")
-        db = {"meta": {"updated": "", "v": DATA_V}, "monthly": {}, "quarterly": {}}
+        db = {"meta": {"updated": "", "v": DATA_V}, "monthly": {}}
+    db.pop("quarterly", None)
     db.setdefault("monthly", {})
-    db.setdefault("quarterly", {})
+    for t, seed in SEED.items():
+        d = db["monthly"].setdefault(t, {"unit": UNITS.get(t, "元/公斤"), "data": {}})["data"]
+        for k, v in seed.items():
+            d.setdefault(k, v)
 
     crashed = 0
     for name, fn in [("博亚和讯", source_boyar), ("猪业分会", source_caaa)]:
@@ -199,20 +204,16 @@ def main():
         print("错误：两个数据源全部失败")
         sys.exit(1)
 
-    # 只保留 2023 年起的数据
-    for grp in ("monthly", "quarterly"):
-        for t, v in db[grp].items():
-            v["data"] = {k: x for k, x in v["data"].items() if k >= "2023"}
-
+    for t, v in db["monthly"].items():
+        v["data"] = {k: x for k, x in v["data"].items() if k >= "2023-01"}
     db["meta"]["updated"] = datetime.date.today().isoformat()
     db["meta"]["v"] = DATA_V
     new = '<script id="pig-data" type="application/json">\n%s\n</script>' % json.dumps(db, ensure_ascii=False, indent=1)
     save_html(re.sub(r'<script id="pig-data" type="application/json">.*?</script>', new, html_text, flags=re.S), sha)
 
-    for t in [c[0] for c in CORES]:
-        grp = "quarterly" if "存栏" in t else "monthly"
-        ks = sorted(db[grp].get(t, {}).get("data", {}).keys())
-        print("%s: %d 期 %s" % (t, len(ks), ks[:2] + ["..."] + ks[-2:] if len(ks) > 4 else ks))
+    for t in [x[0] for x in TARGETS]:
+        ks = sorted(db["monthly"].get(t, {}).get("data", {}).keys())
+        print("%s: %d 期 %s .. %s" % (t, len(ks), ks[0] if ks else "-", ks[-1] if ks else "-"))
     print("完成，更新日期 %s" % db["meta"]["updated"])
 
 
